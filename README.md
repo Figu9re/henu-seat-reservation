@@ -55,8 +55,7 @@ C:\ProgramData\Anaconda3\python.exe henu_main.py --account <学号>
 henu_main.py     主程序：抢座时序、调用链、连续重试
 henu_login.py    登录模块：CAS 登录、token 凭证、keyring 密码
 henu_client.py   请求模块：HTTP 收发、预约请求加密、cookie 管理
-henu_accounts.json  账号与座位配置
-henu_tech_report.md / henu_seat_reservation_report.md   技术文档与攻坚记录
+henu_accounts.example.json  账号与座位配置模板（复制为 henu_accounts.json 后填写）
 ```
 
 ## 注意事项
