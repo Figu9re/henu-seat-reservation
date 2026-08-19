@@ -1,0 +1,12 @@
+# 会话凭证（token/cookie），绝不入库
+.credentials/
+
+# 账号配置（含真实姓名/学号），只上传模板 henu_accounts.example.json
+henu_accounts.json
+
+# 本地文档（报告、学习笔记），不上传
+.docx/
+
+# Python 编译产物
+__pycache__/
+*.pyc

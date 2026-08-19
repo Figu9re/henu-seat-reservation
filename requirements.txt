@@ -1,0 +1,16 @@
+# 河大图书馆座位自动预约 —— 运行环境要求
+#
+# 【系统】Windows（密码存 Windows 凭据管理器，keyring 依赖其 DPAPI 加密）
+# 【Python】3.x，建议用 Anaconda 环境，实测路径：C:\ProgramData\Anaconda3\python.exe
+# 【网络】需能访问学校服务器：
+#   - ids.henu.edu.cn   （统一认证 CAS 登录）
+#   - zwyy.henu.edu.cn  （座位预约业务）
+#   脚本已强制走 IPv4，无需手动配置
+# 【定时（可选）】Windows 任务计划程序每天 06:29 启动正式模式；
+#   需电脑开机且系统时钟准确
+#
+# 安装依赖：C:\ProgramData\Anaconda3\python.exe -m pip install -r requirements.txt
+
+pycryptodome
+keyring
+beautifulsoup4

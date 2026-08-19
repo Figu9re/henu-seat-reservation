@@ -1,0 +1,6 @@
+{
+  "accounts": [
+    {"name": "张三", "username": "学号1", "area": "二楼大厅走廊", "seat_no": 15},
+    {"name": "李四", "username": "学号2", "area": "二楼大厅走廊", "seat_no": 16}
+  ]
+}
