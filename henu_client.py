@@ -8,16 +8,8 @@ import json
 import datetime
 import time
 import base64
-import socket
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-
-# 强制 IPv4：ids.henu.edu.cn 的 DNS 同时返回 IPv6 地址，本机 IPv6 路由不通，
-# urllib 默认先试 IPv6 会一直卡到超时。拦截 getaddrinfo 只保留 IPv4 结果。
-_orig_getaddrinfo = socket.getaddrinfo
-def _force_ipv4(*args, **kwargs):
-    return [r for r in _orig_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]
-socket.getaddrinfo = _force_ipv4
 
 api_base = "https://zwyy.henu.edu.cn"
 
@@ -96,9 +88,18 @@ def http_request(url, data=None, retries=3, timeout=10):
             return urllib.request.urlopen(req, timeout=timeout)
         except Exception as e:
             last_err = e
+            reason = getattr(e, "reason", None)
+            print(
+                "请求失败(%s) %s，原因: %r，底层原因: %r，%.1f 秒后重试..."
+                % (
+                    type(e).__name__,
+                    url.rsplit("/", 1)[-1],
+                    e,
+                    reason,
+                    attempt + 1,
+                )
+            )
             if attempt < retries - 1:
-                print("请求失败(%s) %s，%.1f 秒后重试..." % (
-                    type(e).__name__, url.rsplit("/", 1)[-1], attempt + 1))
                 time.sleep(attempt + 1)
     raise last_err
 
