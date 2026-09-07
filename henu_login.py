@@ -18,7 +18,8 @@ import henu_client
 
 KEYRING_SERVICE = "henu_seat_reservation"
 login_page_url = "https://ids.henu.edu.cn/authserver/login?service=https%3A%2F%2Fzwyy.henu.edu.cn%2Fv4%2Flogin%2Fcas"
-login_post_url = "https://ids.henu.edu.cn/authserver/login"
+# 登录表单会把 service 保留在 action 查询参数中；缺少它时 CAS 不会签发业务 ticket。
+login_post_url = login_page_url
 TOKEN_FILE = os.path.join(henu_client.CRED_DIR, "henu_token.json")
 
 # AES 加密的字符集（对应 JS 里的 $aes_chars）
@@ -55,6 +56,16 @@ def setup_account(username):
     global TOKEN_FILE
     TOKEN_FILE = os.path.join(henu_client.CRED_DIR, "henu_token_%s.json" % username)
     henu_client.setup_account_files(username)
+
+
+def save_captcha_image(username):
+    """下载当前 CAS 会话验证码，返回本地临时图片路径。"""
+    captcha_url = "https://ids.henu.edu.cn/authserver/getCaptcha.htl?_=%s" % datetime.datetime.now().timestamp()
+    response = henu_client.http_request(captcha_url)
+    path = os.path.join(henu_client.CRED_DIR, "henu_captcha_%s.png" % username)
+    with open(path, "wb") as f:
+        f.write(response.read())
+    return path
 
 
 def load_token():
@@ -132,17 +143,25 @@ def login(username=None, password=None):
                 "https://ids.henu.edu.cn/authserver/checkNeedCaptcha.htl",
                 data=check_data).read().decode('utf-8')
             print("\ncheckNeedCaptcha 响应:", check_resp)
-            need_captcha = '"isNeed":true' in check_resp
+            try:
+                need_captcha = bool(json.loads(check_resp).get("isNeed"))
+            except (TypeError, ValueError):
+                need_captcha = '"isNeed":true' in check_resp.replace(" ", "")
         except Exception as e:
             print("checkNeedCaptcha 调用失败:", e)
 
         captcha = ""
         if need_captcha:
+            try:
+                print("验证码图片:", save_captcha_image(username))
+            except Exception as e:
+                print("验证码图片下载失败:", e)
             captcha = input("需要验证码，请输入验证码: ")
 
         encrypted_pwd = encrypt_password(password, pwd_encrypt_salt)
         post_data = {
             'username': username,
+            # 页面上的 id 是 saltPassword，但提交字段名仍是 password。
             'password': encrypted_pwd,
             'captcha': captcha,
             'execution': execution,

@@ -4,9 +4,26 @@
 # 账号配置（含真实姓名/学号），只上传模板 henu_accounts.example.json
 henu_accounts.json
 
-# 本地文档（报告、学习笔记），不上传
+# 本地资料、文档、测试、临时文件
+official-references/
 .docx/
+tests/
+tmp/
 
 # Python 编译产物
 __pycache__/
 *.pyc
+
+# 项目规则
+CLAUDE.md
+AGENTS.md
+
+# 学习
+.teach/
+assets/
+lessons/
+reference/
+learning-records/
+支架/
+NOTES.md
+RESOURCES.md

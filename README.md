@@ -58,7 +58,24 @@ henu_client.py   请求模块：HTTP 收发、预约请求加密、cookie 管理
 henu_accounts.example.json  账号与座位配置模板（复制为 henu_accounts.json 后填写）
 ```
 
-## 注意事项
+## 登录页诊断
+
+重新检查 CAS 登录页面和 JavaScript 时，使用只读诊断脚本：
+
+```text
+C:\ProgramData\Anaconda3\python.exe cas_login_diagnose.py --summary-only
+```
+
+该脚本只 GET 登录页及同源 JavaScript，静态检查 `execution`、`lt`、`pwdEncryptSalt`、密码加密、验证码检查和登录提交字段；不会读取密码、提交登录表单、换取 token 或发送预约请求。外部 JavaScript 不会被执行。
+
+输出 JSON 报告：
+
+```text
+C:\ProgramData\Anaconda3\python.exe cas_login_diagnose.py --format json --output cas-login-report.json
+```
+
+不要用 `henu_main.py --now` 代替诊断，它会真实发送预约请求。
+
 
 - token/cookie 为会话凭证，已被 `.gitignore` 排除，不会进入版本库
 - 服务端接口未公开，可能随时变动

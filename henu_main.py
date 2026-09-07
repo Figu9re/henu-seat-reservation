@@ -70,20 +70,21 @@ def build_confirm_request(token, account, day):
     print("\n=== 目标: %s（明天）| 区域: %s | 座位号: %s ===" % (day, area_name, seat_no))
 
     top = henu_client.post_json(henu_client.api_base + "/v4/space/pcTopFor", {"day": day}, token)
-    campus_id = floor_id = None
+    campus_id = None
+    floor_ids = []
     for c in top["data"]["list"]:
         if c["name"] == "金明校区":
             campus_id = c["id"]
-            for ch in c.get("children", []):
-                if ch["name"] == "金明二楼":
-                    floor_id = ch["id"]
-    if not (campus_id and floor_id):
+            floor_ids = [ch["id"] for ch in c.get("children", [])]
+            break
+    if not (campus_id and floor_ids):
         print("定位校区/楼层失败")
         return None
 
     pick = henu_client.post_json(henu_client.api_base + "/v4/space/pick", {
         "premisesIds": [campus_id], "categoryIds": [],
-        "storeyIds": [floor_id], "boutiqueIds": [], "date": day,
+        # 账号配置只指定区域名；跨校区楼层目录查找，避免楼层写死导致找不到目标区域。
+        "storeyIds": floor_ids, "boutiqueIds": [], "date": day,
     }, token)
     area_id = None
     for a in pick.get("data", {}).get("area", []):

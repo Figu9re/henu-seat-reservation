@@ -52,6 +52,9 @@ def post_json(url, data, token=None, retries=3):
     body = json.dumps(data).encode('utf-8')
     h = dict(headers)
     h["Content-Type"] = "application/json"
+    # 与预约站点前端 axios 请求保持一致，部分登录接口会校验该 AJAX 标记。
+    h["Accept"] = "application/json, text/plain, */*"
+    h["X-Requested-With"] = "XMLHttpRequest"
     if token:
         h["authorization"] = "bearer" + token
     last_err = None
