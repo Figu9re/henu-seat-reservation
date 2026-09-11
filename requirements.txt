@@ -6,7 +6,7 @@
 #   - ids.henu.edu.cn   （统一认证 CAS 登录）
 #   - zwyy.henu.edu.cn  （座位预约业务）
 #   脚本已强制走 IPv4，无需手动配置
-# 【定时（可选）】Windows 任务计划程序每天 06:29 启动正式模式；
+# 【定时（可选）】Windows 任务计划程序每天 06:29 启动正式模式，以便在 06:30:00 前完成预约准备；
 #   需电脑开机且系统时钟准确
 #
 # 安装依赖：C:\ProgramData\Anaconda3\python.exe -m pip install -r requirements.txt
