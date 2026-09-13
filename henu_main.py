@@ -2,15 +2,15 @@
 # henu_main.py —— 主程序：每天 6:30 开放"明天"预约时，为指定账号抢约指定座位
 #
 # 用法：
-#   python henu_main.py --account <学号>              正常模式：等到 6:29:59.8 登录，开放瞬间连续重试抢座
+#   python henu_main.py --account <学号>              正常模式：登录后等到开放后 0.1 秒，连续重试抢座
 #   python henu_main.py --account <学号> --now        测试模式：立即发一次请求（不等待），用于验证流程
 #
 # 账号配置在 henu_accounts.json：每个账号一行（name / username / area / seat_no）
 # 密码存 Windows 凭据管理器（keyring），某账号首次运行时交互输入一次
 #
-# 抢座策略：开放前 0.2 秒发出第一枪，之后每隔 0.25 秒重试一次，直到收到明确结果
-#   （code=0 成功 / 已预约过）或开放后 6 秒仍未成功才停止。区分不了"未开放"的
-#   响应一律继续重试，保证开放瞬间一定能覆盖到。
+# 抢座策略：开放前完成请求参数获取，开放后 0.1 秒发送首个请求，之后每隔 0.25 秒
+#   重试一次，直到收到明确结果（code=0 成功 / 已预约过）或开放后 6 秒仍未成功才停止。
+#   每次重试复用同一份 request_data，仅重新加密并发送，不重新查询座位信息。
 #
 # 模块分工：
 #   henu_client.py  请求模块：HTTP 收发 + 预约请求加密
@@ -28,9 +28,9 @@ import henu_client
 import henu_login
 
 SEND_HOUR, SEND_MIN, SEND_SEC = 6, 30, 0      # 每天 6:30:00 开放"明天"预约
-RETRY_START_OFFSET = 0.2      # 开放前 0.2 秒发出第一枪
+RETRY_START_OFFSET = 0.1      # 开放后 0.1 秒发送首个请求
 RETRY_INTERVAL = 0.25         # 每 0.25 秒重试一次
-RETRY_TIMEOUT = 6             # 最多持续到开放后 6 秒
+RETRY_TIMEOUT = 60             # 最多持续到开放后 60 秒
 
 
 def load_config():
@@ -136,11 +136,18 @@ def build_confirm_request(token, account, day):
 
 
 def send_confirm(token, confirm_data):
+    """发送预约请求，并返回响应及接收时间。"""
     aesjson = henu_client.encrypt_aesjson(confirm_data)
     res = henu_client.post_json(henu_client.api_base + "/v4/space/confirm", {"aesjson": aesjson}, token)
+    received_at = datetime.datetime.now()
     msg = res.get("message") or res.get("msg") or ""
     print("code:", res.get("code"), "| msg:", msg)
-    return res
+    return res, received_at
+
+
+def log_response_elapsed(target_time, received_at):
+    elapsed = (received_at - target_time).total_seconds()
+    print("响应耗时（相对开放时间）: %.3f 秒" % elapsed)
 
 
 def is_final(res):
@@ -156,25 +163,31 @@ def is_final(res):
     return False
 
 
-def reserve_with_retry(token, account, max_attempts=None):
-    """开放瞬间连续重试抢座。max_attempts 用于测试模式（只发一枪）。"""
+def reserve_with_retry(token, account, max_attempts=None, request_data=None,
+                       target_time=None):
+    """开放瞬间连续重试抢座。"""
     day = str(datetime.date.today() + datetime.timedelta(days=1))
-    while True:
-        try:
-            confirm_data = build_confirm_request(token, account, day)
-        except Exception as e:
-            print("定位请求异常(%s)，1 秒后重试..." % type(e).__name__)
-            confirm_data = None
-        if confirm_data:
-            break
-        print("定位/构造失败，1 秒后重试...")
-        time.sleep(1)
+    if request_data is None:
+        while True:
+            try:
+                request_data = build_confirm_request(token, account, day)
+            except Exception as e:
+                print("定位请求异常(%s)，1 秒后重试..." % type(e).__name__)
+                request_data = None
+            if request_data:
+                break
+            print("定位/构造失败，1 秒后重试...")
+            time.sleep(1)
 
-    deadline = datetime.datetime.now() + datetime.timedelta(seconds=RETRY_TIMEOUT)
+    if target_time is None:
+        target_time = datetime.datetime.now()
+    deadline = target_time + datetime.timedelta(seconds=RETRY_TIMEOUT)
     attempts = 0
     while True:
         try:
-            res = send_confirm(token, confirm_data)
+            res, received_at = send_confirm(token, request_data)
+            if target_time is not None:
+                log_response_elapsed(target_time, received_at)
         except Exception as e:
             print("预约请求异常(%s)，继续重试..." % type(e).__name__)
             res = None
@@ -195,17 +208,37 @@ def main(account, username):
     open_at = now.replace(hour=SEND_HOUR, minute=SEND_MIN, second=SEND_SEC, microsecond=0)
     if open_at <= now:
         open_at += datetime.timedelta(days=1)
-    login_at = open_at - datetime.timedelta(seconds=15)
-    retry_start = open_at - datetime.timedelta(seconds=RETRY_START_OFFSET)
+    login_at = open_at - datetime.timedelta(seconds=60)
     print("当前时间:", now.strftime("%Y-%m-%d %H:%M:%S"))
     print("开放时刻:", open_at.strftime("%Y-%m-%d %H:%M:%S"))
     print("抢座账号:", account["name"], "| 座位:", account["seat_no"])
+
     wait_until(login_at)
     print("\n时间到，开始登录...")
     token = ensure_login(username)
-    wait_until(retry_start)
+    day = str(open_at.date() + datetime.timedelta(days=1))
+    # 座位信息和 confirm 参数必须在开放前准备好；开放后的关键路径只做加密和 POST。
+    # 开放前服务器可能尚未放出"明天"数据，给参数获取本身留到 6:30:00.1 的短重试窗口。
+    build_deadline = open_at + datetime.timedelta(seconds=RETRY_START_OFFSET)
+    request_data = None
+    while datetime.datetime.now() < build_deadline:
+        try:
+            request_data = build_confirm_request(token, account, day)
+        except Exception as e:
+            print("参数获取异常(%s)，重试..." % type(e).__name__)
+            request_data = None
+        if request_data:
+            break
+        time.sleep(1)
+    if not request_data:
+        raise SystemExit("开放前未能构造预约请求")
+    print("request_data:", json.dumps(request_data, ensure_ascii=False))
+
+    wait_until(build_deadline)
     print("到点，开始连续抢座")
-    reserve_with_retry(token, account)
+    reserve_with_retry(
+        token, account, request_data=request_data,
+        target_time=open_at + datetime.timedelta(seconds=RETRY_START_OFFSET))
 
 
 def run_cli():
