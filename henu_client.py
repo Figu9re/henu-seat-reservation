@@ -48,7 +48,11 @@ def setup_account_files(username):
 
 # 通用的 POST JSON 请求封装（带 token 时加 authorization 头）
 # 网络瞬时抖动（超时/断连）会自动重试，避免抢座过程中因一次抖动崩溃
-def post_json(url, data, token=None, retries=3):
+def _fmt_ts(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def post_json(url, data, token=None, retries=3, on_attempt=None, timeout=10):
     body = json.dumps(data).encode('utf-8')
     h = dict(headers)
     h["Content-Type"] = "application/json"
@@ -58,16 +62,38 @@ def post_json(url, data, token=None, retries=3):
     if token:
         h["authorization"] = "bearer" + token
     last_err = None
+    url_tail = url.rsplit("/", 1)[-1]
     for attempt in range(retries):
+        started_at = datetime.datetime.now()
         try:
             req = urllib.request.Request(url, data=body, headers=h, method="POST")
-            resp = urllib.request.urlopen(req, timeout=10)
-            return json.loads(resp.read().decode('utf-8'))
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            parsed = json.loads(resp.read().decode('utf-8'))
+            if on_attempt is not None:
+                on_attempt({
+                    "ok": True,
+                    "http_attempt": attempt + 1,
+                    "started_at": _fmt_ts(started_at),
+                    "ended_at": _fmt_ts(datetime.datetime.now()),
+                    "http_status": getattr(resp, "status", None),
+                    "url_tail": url_tail,
+                })
+            return parsed
         except Exception as e:
             last_err = e
+            if on_attempt is not None:
+                on_attempt({
+                    "ok": False,
+                    "http_attempt": attempt + 1,
+                    "started_at": _fmt_ts(started_at),
+                    "ended_at": _fmt_ts(datetime.datetime.now()),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "url_tail": url_tail,
+                })
             if attempt < retries - 1:
                 print("请求失败(%s) %s，%.1f 秒后重试..." % (
-                    type(e).__name__, url.rsplit("/", 1)[-1], attempt + 1))
+                    type(e).__name__, url_tail, attempt + 1))
                 time.sleep(attempt + 1)
     raise last_err
 
