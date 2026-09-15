@@ -3,16 +3,17 @@
 #
 # 用法：
 #   python henu_main.py --account <学号>              正常模式：登录后等到开放后 0.1 秒，连续抢座
-#   python henu_main.py --account <学号> --now        测试模式：立即按同一套停止规则抢座
+#   python henu_main.py --account <学号> --now        测试模式：查座并构造 confirm 后等 30 秒再抢座
 #
 # 账号配置在 henu_accounts.json：每个账号一行（name / username / area / seat_no）
 # seat_no 可以是整数，也可以是按优先级排列的列表，例如 [20, 19, 18]
 # 密码存 Windows 凭据管理器（keyring），某账号首次运行时交互输入一次
 #
 # 抢座策略：开放前为所有目标座位构造 confirm 请求体。开放后 0.1 秒开火，
-#   4 个 worker 重叠 RTT；仅第一枪按 0.20 秒错开，回包后立即再发。确认请求 retries=1、timeout=3。
-#   code=0 成功停止；code=1 立刻改抢下一个座位；其它结果继续抢当前座位。
-#   开火后 60 秒仍未成功则停止。
+#   10 个 worker 重叠 RTT；仅第一枪按 WORKER_STAGGER 错开，回包后立即再发。
+#   每个 worker 复用一条 HTTPS 长连接。确认请求 retries=1、timeout=3。
+#   code=0 成功停止；code=1 且已存在预约则停止；code=1 当前座位不可约则立刻改抢下一个；
+#   其它结果继续抢当前座位。开火后 60 秒仍未成功则停止。
 #
 # 模块分工：
 #   henu_client.py  请求模块：HTTP 收发 + 预约请求加密
@@ -34,10 +35,11 @@ import henu_login
 SEND_HOUR, SEND_MIN, SEND_SEC = 6, 30, 0      # 每天 6:30:00 开放"明天"预约
 RETRY_START_OFFSET = 0.1      # 开放后 0.1 秒发送首个请求
 RETRY_TIMEOUT = 60             # 最多持续到开放后 60 秒
-CONCURRENCY = 4                # 同时在途的确认请求数，用来重叠 RTT
-WORKER_STAGGER = 0.20          # 仅第一枪错开：worker i 等待 (i-1)*0.20 秒
+CONCURRENCY = 10                # 同时在途的确认请求数，用来重叠 RTT
+WORKER_STAGGER = 0.08          # 仅第一枪错开：worker i 等待 (i-1)*WORKER_STAGGER 秒
 CONFIRM_TIMEOUT = 3            # 确认请求超时；挂死的 worker 不能占满窗口
 LOG_DIR = "logs"               # 每次运行一份 jsonl，热路径只入队
+NOW_FIRE_DELAY = 30            # 仅 --now：构造 confirm 后等待再开火
 
 
 def load_config():
@@ -88,6 +90,25 @@ def wait_until(moment):
         if remain <= 0:
             return
         time.sleep(min(3600, remain))
+
+
+def wait_now_fire(log_fp=None):
+    """仅测试模式：构造 confirm 后等待 NOW_FIRE_DELAY 秒。正式模式不调用。"""
+    started_at = datetime.datetime.now()
+    until = started_at + datetime.timedelta(seconds=NOW_FIRE_DELAY)
+    print("[测试模式] 开始等待开火: %s，等到 %s" % (fmt_ts(started_at), fmt_ts(until)))
+    wait_until(until)
+    fired_at = datetime.datetime.now()
+    print("[测试模式] 开始等 %s，等到 %s，实际开火 %s" % (
+        fmt_ts(started_at), fmt_ts(until), fmt_ts(fired_at)))
+    write_log(log_fp, {
+        "event": "now_wait",
+        "started_at": fmt_ts(started_at),
+        "until": fmt_ts(until),
+        "fired_at": fmt_ts(fired_at),
+        "delay_sec": NOW_FIRE_DELAY,
+    })
+    return fired_at
 
 
 def fmt_ts(dt=None):
@@ -318,17 +339,22 @@ def build_confirm_targets(token, account, day, quiet=False):
 
 
 def send_confirm(token, confirm_data, on_http_attempt=None,
-                 retries=1, timeout=CONFIRM_TIMEOUT):
+                 retries=1, timeout=CONFIRM_TIMEOUT, conn=None):
     """发送预约请求，并返回响应及接收时间。确认路径不做内部退避。"""
     aesjson = henu_client.encrypt_aesjson(confirm_data)
     kwargs = {"retries": retries, "timeout": timeout}
     if on_http_attempt is not None:
         kwargs["on_attempt"] = on_http_attempt
-    res = henu_client.post_json(
-        henu_client.api_base + "/v4/space/confirm",
-        {"aesjson": aesjson},
-        token,
-        **kwargs)
+    payload = {"aesjson": aesjson}
+    if conn is not None:
+        # worker 长连接：不走全局 opener，retries 仍传进去但连接层只打一枪
+        res = conn.post_json("/v4/space/confirm", payload, token, **kwargs)
+    else:
+        res = henu_client.post_json(
+            henu_client.api_base + "/v4/space/confirm",
+            payload,
+            token,
+            **kwargs)
     received_at = datetime.datetime.now()
     return res, received_at
 
@@ -353,6 +379,11 @@ def log_postmortem(fp, token, account, day):
         })
 
 
+def already_reserved_message(msg):
+    """code=1 里账号已有预约。包含匹配，避免整句标点差异。"""
+    return "已存在座位预约" in (msg or "")
+
+
 def _run_grab_workers(token, targets, target_time, deadline, log_queue, log_fp=None):
     lock = threading.Lock()
     state = {
@@ -363,90 +394,102 @@ def _run_grab_workers(token, targets, target_time, deadline, log_queue, log_fp=N
         "last_res": None,
         "last_seat_no": None,
     }
+    cookie = henu_client.cookie_header(henu_client.api_base + "/v4/space/confirm")
 
     def worker(worker_id):
         delay = (worker_id - 1) * WORKER_STAGGER
         if delay > 0:
             time.sleep(delay)
-        while True:
-            now = datetime.datetime.now()
-            with lock:
-                if state["stop"]:
-                    return
-                if now >= deadline:
-                    state["stop"] = True
-                    state["reason"] = "timeout"
-                    return
-                idx = state["seat_index"]
-                if idx >= len(targets):
-                    state["stop"] = True
-                    state["reason"] = "no_seats"
-                    return
-                target = targets[idx]
-                state["attempts"] += 1
-                attempt = state["attempts"]
-            http_trace = []
-            sent_at = datetime.datetime.now()
-            try:
-                res, received_at = send_confirm(
-                    token, target["request_data"], on_http_attempt=http_trace.append)
-            except Exception as e:
+        # 对象在这里创建；真正的 TCP/TLS 等到第一枪 send_confirm
+        conn = henu_client.ConfirmHttpsConn(cookie=cookie)
+        try:
+            while True:
+                now = datetime.datetime.now()
+                with lock:
+                    if state["stop"]:
+                        return
+                    if now >= deadline:
+                        state["stop"] = True
+                        state["reason"] = "timeout"
+                        return
+                    idx = state["seat_index"]
+                    if idx >= len(targets):
+                        state["stop"] = True
+                        state["reason"] = "no_seats"
+                        return
+                    target = targets[idx]
+                    state["attempts"] += 1
+                    attempt = state["attempts"]
+                http_trace = []
+                sent_at = datetime.datetime.now()
+                try:
+                    res, received_at = send_confirm(
+                        token, target["request_data"],
+                        on_http_attempt=http_trace.append, conn=conn)
+                except Exception as e:
+                    emit_log(log_queue, {
+                        "event": "confirm_error",
+                        "worker": worker_id,
+                        "attempt": attempt,
+                        "seat_no": target["seat_no"],
+                        "sent_at": fmt_ts(sent_at),
+                        "received_at": fmt_ts(),
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                        "http": http_trace,
+                    }, log_fp)
+                    continue
                 emit_log(log_queue, {
-                    "event": "confirm_error",
+                    "event": "confirm",
                     "worker": worker_id,
                     "attempt": attempt,
                     "seat_no": target["seat_no"],
+                    "seat_id": target["request_data"].get("seat_id"),
                     "sent_at": fmt_ts(sent_at),
-                    "received_at": fmt_ts(),
-                    "error_type": type(e).__name__,
-                    "error": str(e),
+                    "received_at": fmt_ts(received_at),
+                    "rtt_ms": int(round((received_at - sent_at).total_seconds() * 1000)),
+                    "elapsed_from_target_ms": int(round(
+                        (received_at - target_time).total_seconds() * 1000)),
+                    "code": res.get("code"),
+                    "msg": res.get("message") or res.get("msg") or "",
+                    "response": res,
                     "http": http_trace,
                 }, log_fp)
-                continue
-            emit_log(log_queue, {
-                "event": "confirm",
-                "worker": worker_id,
-                "attempt": attempt,
-                "seat_no": target["seat_no"],
-                "seat_id": target["request_data"].get("seat_id"),
-                "sent_at": fmt_ts(sent_at),
-                "received_at": fmt_ts(received_at),
-                "rtt_ms": int(round((received_at - sent_at).total_seconds() * 1000)),
-                "elapsed_from_target_ms": int(round(
-                    (received_at - target_time).total_seconds() * 1000)),
-                "code": res.get("code"),
-                "msg": res.get("message") or res.get("msg") or "",
-                "response": res,
-                "http": http_trace,
-            }, log_fp)
-            code = res.get("code")
-            switch_from = None
-            switch_to = None
-            with lock:
-                state["last_res"] = res
-                state["last_seat_no"] = target["seat_no"]
-                if state["stop"]:
-                    return
-                if code == 0:
-                    state["stop"] = True
-                    state["reason"] = "success"
-                    return
-                if code == 1:
-                    if (state["seat_index"] < len(targets)
-                            and targets[state["seat_index"]] is target):
-                        switch_from = target["seat_no"]
-                        state["seat_index"] += 1
-                        if state["seat_index"] >= len(targets):
-                            state["stop"] = True
-                            state["reason"] = "no_seats"
-                        else:
-                            switch_to = targets[state["seat_index"]]["seat_no"]
-            if switch_from is not None:
-                emit_log(log_queue, {
-                    "event": "seat_switch",
-                    "from": switch_from,
-                    "to": switch_to,
-                }, log_fp)
+                code = res.get("code")
+                msg = res.get("message") or res.get("msg") or ""
+                switch_from = None
+                switch_to = None
+                with lock:
+                    state["last_res"] = res
+                    state["last_seat_no"] = target["seat_no"]
+                    if state["stop"]:
+                        return
+                    if code == 0:
+                        state["stop"] = True
+                        state["reason"] = "success"
+                        return
+                    if code == 1 and already_reserved_message(msg):
+                        state["stop"] = True
+                        state["reason"] = "already_reserved"
+                        return
+                    if code == 1:
+                        if (state["seat_index"] < len(targets)
+                                and targets[state["seat_index"]] is target):
+                            switch_from = target["seat_no"]
+                            state["seat_index"] += 1
+                            if state["seat_index"] >= len(targets):
+                                state["stop"] = True
+                                state["reason"] = "no_seats"
+                            else:
+                                switch_to = targets[state["seat_index"]]["seat_no"]
+                if switch_from is not None:
+                    emit_log(log_queue, {
+                        "event": "seat_switch",
+                        "from": switch_from,
+                        "to": switch_to,
+                    }, log_fp)
+        finally:
+            conn.close()
 
     threads = []
     n = max(1, int(CONCURRENCY))
@@ -459,8 +502,8 @@ def _run_grab_workers(token, targets, target_time, deadline, log_queue, log_fp=N
     return state
 
 
-def reserve_with_retry(token, account, targets=None, target_time=None, log_fp=None):
-    """开放瞬间并发抢座，code=1 时按配置顺序切座。"""
+def reserve_with_retry(token, account, targets=None, target_time=None, log_fp=None, fire_delay=0):
+    """开放瞬间并发抢座。code=1 已存在预约则停；其它 code=1 按配置顺序切座。"""
     day = str(datetime.date.today() + datetime.timedelta(days=1))
     if targets is None:
         while True:
@@ -489,6 +532,10 @@ def reserve_with_retry(token, account, targets=None, target_time=None, log_fp=No
             write_log(log_fp, {"event": "build", "ok": False})
             time.sleep(1)
 
+    if fire_delay:
+        fired_at = wait_now_fire(log_fp)
+        if target_time is None:
+            target_time = fired_at
     if target_time is None:
         target_time = datetime.datetime.now()
     deadline = target_time + datetime.timedelta(seconds=RETRY_TIMEOUT)
@@ -505,6 +552,8 @@ def reserve_with_retry(token, account, targets=None, target_time=None, log_fp=No
     reason = state.get("reason") or "unknown"
     if reason == "success":
         print("=== 预约成功 ===")
+    elif reason == "already_reserved":
+        print("=== 当前用户已存在座位预约，停止 ===")
     elif reason == "timeout":
         print("=== 开放后 %s 秒仍未成功，停止 ===" % RETRY_TIMEOUT)
     elif reason == "no_seats":
@@ -597,7 +646,7 @@ def main(account, username, log_fp=None):
 def run_cli():
     parser = argparse.ArgumentParser(description="河大图书馆抢座脚本")
     parser.add_argument("--account", required=True, help="学号，必须在 henu_accounts.json 里")
-    parser.add_argument("--now", action="store_true", help="测试模式：立即按同一套停止规则抢座，不等待开放时刻")
+    parser.add_argument("--now", action="store_true", help="测试模式：查座并构造 confirm 后等待 30 秒再抢座，不等待开放时刻")
     args = parser.parse_args()
 
     accounts = load_config()
@@ -614,9 +663,9 @@ def run_cli():
             "seat_no": normalize_seat_nos(account),
         })
         if args.now:
-            print("[测试模式] 立即发送（跳过等待）")
+            print("[测试模式] 查座并构造请求后等待 %s 秒再开火" % NOW_FIRE_DELAY)
             token = ensure_login(args.account)
-            reserve_with_retry(token, account, log_fp=log_fp)
+            reserve_with_retry(token, account, log_fp=log_fp, fire_delay=NOW_FIRE_DELAY)
         else:
             main(account, args.account, log_fp=log_fp)
     finally:

@@ -4,7 +4,10 @@
 import os
 import urllib.request
 import http.cookiejar
+import http.client
+import ssl
 import json
+from urllib.parse import urlparse
 import datetime
 import time
 import base64
@@ -50,6 +53,104 @@ def setup_account_files(username):
 # 网络瞬时抖动（超时/断连）会自动重试，避免抢座过程中因一次抖动崩溃
 def _fmt_ts(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+_SSL_CONTEXT = ssl.create_default_context()
+
+
+def cookie_header(url):
+    """从当前 cookiejar 取出 Cookie 头。确认路径只读快照，不经 opener。"""
+    req = urllib.request.Request(url)
+    try:
+        cj.add_cookie_header(req)
+    except Exception:
+        return None
+    return req.get_header("Cookie")
+
+
+class ConfirmHttpsConn(object):
+    """单个 grab worker 的 HTTPS 长连接。不是连接池；一条连接只给一个 worker。"""
+
+    def __init__(self, cookie=None):
+        parsed = urlparse(api_base)
+        self.host = parsed.hostname
+        self.port = parsed.port or 443
+        self.cookie = cookie
+        self.conn = None
+
+    def close(self):
+        conn = self.conn
+        self.conn = None
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _ensure_conn(self, timeout):
+        """已有活 socket 则复用，否则新建。返回是否复用了 TLS。"""
+        sock = None if self.conn is None else getattr(self.conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.settimeout(timeout)
+                self.conn.timeout = timeout
+                return True
+            except Exception:
+                self.close()
+        elif self.conn is not None:
+            self.close()
+        self.conn = http.client.HTTPSConnection(
+            self.host, port=self.port, timeout=timeout, context=_SSL_CONTEXT)
+        return False
+
+    def post_json(self, path, data, token=None, timeout=3, on_attempt=None, **_kwargs):
+        body = json.dumps(data).encode("utf-8")
+        h = dict(headers)
+        h["Content-Type"] = "application/json"
+        h["Accept"] = "application/json, text/plain, */*"
+        h["X-Requested-With"] = "XMLHttpRequest"
+        h["Connection"] = "keep-alive"
+        if token:
+            h["authorization"] = "bearer" + token
+        if self.cookie:
+            h["Cookie"] = self.cookie
+        url_tail = path.rsplit("/", 1)[-1]
+        started_at = datetime.datetime.now()
+        reused = False
+        try:
+            reused = self._ensure_conn(timeout)
+            self.conn.request("POST", path, body=body, headers=h)
+            resp = self.conn.getresponse()
+            raw = resp.read()
+            parsed = json.loads(raw.decode("utf-8"))
+            if on_attempt is not None:
+                on_attempt({
+                    "ok": True,
+                    "http_attempt": 1,
+                    "started_at": _fmt_ts(started_at),
+                    "ended_at": _fmt_ts(datetime.datetime.now()),
+                    "http_status": getattr(resp, "status", None),
+                    "url_tail": url_tail,
+                    "conn_reused": reused,
+                })
+            if getattr(resp, "will_close", False):
+                self.close()
+            return parsed
+        except Exception as e:
+            if on_attempt is not None:
+                on_attempt({
+                    "ok": False,
+                    "http_attempt": 1,
+                    "started_at": _fmt_ts(started_at),
+                    "ended_at": _fmt_ts(datetime.datetime.now()),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "url_tail": url_tail,
+                    "conn_reused": reused,
+                })
+            self.close()
+            raise
 
 
 def post_json(url, data, token=None, retries=3, on_attempt=None, timeout=10):

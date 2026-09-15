@@ -7,11 +7,12 @@ henu_accounts.json
 # 抢座运行日志（含座位号和接口响应，不入库）
 logs/
 
-# 本地资料、文档、测试、临时文件
+# 本地资料、文档、测试、临时文件、日志
 official-references/
 .docx/
 tests/
 tmp/
+logs/
 
 # Python 编译产物
 __pycache__/

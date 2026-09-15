@@ -46,7 +46,7 @@ C:\ProgramData\Anaconda3\python.exe henu_main.py --account <学号>
 | 模式 | 命令 | 说明 |
 |---|---|---|
 | 正式 | `henu_main.py --account <学号>` | 提前完成登录和定位，开放前最后刷新参数，等到 6:30:00 后立即连续抢座 |
-| 测试 | `henu_main.py --account <学号> --now` | 立即按正式规则抢座（含切座），不等待 6:30 |
+| 测试 | `henu_main.py --account <学号> --now` | 查座并构造 confirm 后等 30 秒再按正式规则抢座，不等待 6:30 |
 
 > `--now` 会真实发送预约请求，只在想立刻抢或验证流程时用。
 
